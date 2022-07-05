@@ -2,20 +2,31 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
+	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
-	"github.com/josephsawaya/terraform-controller-worker/cmd/terraform-controller-worker/util"
+	"github.com/hashicorp/terraform-exec/tfexec"
 	"github.com/spf13/cobra"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/rest"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+
+	"github.com/otiai10/copy"
+	argoprojiov1alpha1 "github.com/sabre1041/argocd-terraform-controller/api/v1alpha1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
+
+var (
+	scheme = runtime.NewScheme()
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(argoprojiov1alpha1.AddToScheme(scheme))
+}
 
 type TerraformFile struct {
 	Name    string `json:"name"`
@@ -25,99 +36,74 @@ type TerraformFile struct {
 var RootCmd = &cobra.Command{
 	Use:   "work",
 	Short: "Command to run the terraform-controller's worker",
+	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
-		rconf, err := rest.InClusterConfig()
+		namespace := args[0]
+		name := args[1]
+
+		cl, err := client.New(config.GetConfigOrDie(), client.Options{
+			Scheme: scheme,
+		})
 		if err != nil {
-			klog.Error(err)
-			return
+			fmt.Println("failed to create client")
+			os.Exit(1)
 		}
 
-		// TODO: Using dynamic client here feels incorrect
-		dyn, err := dynamic.NewForConfig(rconf)
+		ctx := context.Background()
+
+		configMapDir := "/opt/manifests/config"
+		workingDir := "/opt/manifests/readable"
+
+		copy.Copy(configMapDir, workingDir)
+
+		tf, err := tfexec.NewTerraform(workingDir, "/usr/local/bin/terraform")
 		if err != nil {
-			klog.Error(err)
-			return
+			klog.Errorf("error running NewTerraform: %s", err)
 		}
 
-		res := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "terraforms"}
+		klog.Infof("NewTerraform Complete")
 
-		terraformList, err := dyn.Resource(res).Namespace("argocd").List(context.Background(), metav1.ListOptions{})
+		backendConfig := fmt.Sprintf(`
+terraform {
+	backend "kubernetes" {
+		secret_suffix     = "%s-tf-controller"
+		in_cluster_config = true
+		namespace         = "%s"
+	}
+}`, name, namespace)
+
+		os.WriteFile("/opt/manifests/readable/backend.tf", []byte(backendConfig), 0644)
+
+		err = tf.Init(ctx, tfexec.Upgrade(true))
 		if err != nil {
-			klog.Error(err)
-			return
+			klog.Errorf("error running Init: %s", err)
 		}
 
-		for _, unstructuredTerraform := range terraformList.Items {
-			listOfContents, exists, err := unstructured.NestedSlice(unstructuredTerraform.UnstructuredContent(), "spec", "list")
-			if err != nil {
-				klog.Error(err)
-				return
-			}
-			if exists == false {
-				klog.Errorf("List field does not exist for %v", unstructuredTerraform.GetName())
-				return
-			}
-
-			for _, content := range listOfContents {
-				klog.Infof("%v: %+v\n\n", unstructuredTerraform.GetName(), content)
-				terraformFile, ok := content.(map[string]interface{})
-				if !ok {
-					klog.Errorf("Unable to convert %+v to TerraformFile", content)
-					return
-				}
-
-				data, err := base64.StdEncoding.DecodeString(terraformFile["content"].(string))
-				if err != nil {
-					klog.Error(err)
-					return
-				}
-
-				terraformPath := strings.TrimPrefix(terraformFile["name"].(string), "./")
-
-				terraformDir := filepath.Dir(terraformPath)
-
-				terraformFileName := filepath.Base(terraformPath)
-
-				err = os.MkdirAll(terraformDir, os.ModePerm)
-				if err != nil {
-					klog.Error(err)
-					return
-				}
-
-				err = os.WriteFile(terraformFileName, data, os.ModePerm)
-				if err != nil {
-					klog.Error(err)
-					return
-				}
-			}
-		}
-
-		// TODO: Replace these with tfexec package
-		err = util.RunTerraformCommand("init", nil)
+		_, err = tf.Plan(ctx)
 		if err != nil {
-			klog.Error(err)
-			return
+			klog.Errorf("error running Plan: %s", err)
 		}
 
-		klog.Info("Init")
-		err = util.RunTerraformCommand("plan", nil)
+		err = tf.Apply(ctx)
 		if err != nil {
-			klog.Error(err)
-			return
+			klog.Errorf("error running Apply: %s", err)
 		}
 
-		klog.Info("Planned")
+		terra := argoprojiov1alpha1.Terraform{}
 
-		yes := "yes\n"
-		err = util.RunTerraformCommand("apply", &yes)
+		err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &terra)
 		if err != nil {
-			klog.Error(err)
-			return
+			klog.Errorf("Error getting %s: %v", name, err)
 		}
 
-		klog.Info("Applied")
+		newTerra := terra.DeepCopy()
 
-		// 	time.Sleep(time.Duration(3) * time.Minute)
+		newTerra.Spec.Completed = true
+
+		err = cl.Patch(ctx, newTerra, client.MergeFrom(terra.DeepCopy()))
+		if err != nil {
+			klog.Errorf("Error patching %s: %v", name, err)
+		}
 	},
 }
 

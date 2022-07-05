@@ -4,8 +4,9 @@ WORKDIR /terraform-controller-worker
 
 COPY go.mod ./
 COPY go.sum ./
+COPY vendor ./
 
-RUN go mod download
+RUN go mod vendor
 
 COPY . .
 
@@ -24,7 +25,7 @@ RUN cd /usr/local/bin && \
     unzip terraform.zip && \
     rm terraform.zip
 
-COPY --from=builder /terraform-controller-worker/bin/terraform-controller-worker /usr/local/bin
+COPY --from=builder /terraform-controller-worker/bin/terraform-controller-worker /usr/local/bin/
 
 WORKDIR /opt/manifests
 

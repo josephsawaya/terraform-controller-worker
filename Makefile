@@ -1,5 +1,7 @@
 .PHONY: all
-all: build
+all: 
+	podman build . -t quay.io/jsawaya/terraform-controller-worker
+	podman push quay.io/jsawaya/terraform-controller-worker
 
 .PHONY: build
 build:
